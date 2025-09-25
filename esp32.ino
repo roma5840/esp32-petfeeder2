@@ -1,7 +1,7 @@
 /*
  *  ASPetFeeder ESP32 Firmware
- *  VERSION 10
- *  Edited tokenStatusCallback and setupFirebaseListeners
+ *  VERSION 11
+ *  Removed setOnDisconnect in setupFirebaseListeners
  */
 
 #include <WiFi.h>
@@ -278,11 +278,6 @@ void setupFirebaseListeners() {
   }
 
   String statusPath = "users/" + uid + "/feederStatus/isOnline";
-  if (Firebase.RTDB.setOnDisconnect(&fbdo, statusPath.c_str(), false)) {
-    Serial.println("onDisconnect handler set for isOnline status.");
-  } else {
-    Serial.println("Failed to set onDisconnect handler: " + fbdo.errorReason());
-  }
   if (Firebase.RTDB.setBool(&fbdo, statusPath.c_str(), true)) {
     Serial.println("Feeder status set to ONLINE.");
   } else {
