@@ -1,6 +1,7 @@
 /*
  *  ASPetFeeder ESP32 Firmware
- *  VERSION 9
+ *  VERSION 10
+ *  Edited tokenStatusCallback and setupFirebaseListeners
  */
 
 #include <WiFi.h>
@@ -49,10 +50,10 @@ bool isInSetupMode = false;
 unsigned long lastStatusUpdate = 0;
 
 void tokenStatusCallback(TokenInfo info) {
-  if (info.status() == token_status_ready) {
+  if (info.status == token_status_ready) {
     Serial.println("Firebase token is ready.");
-  } else if (info.status() == token_status_error) {
-    Serial.printf("Firebase token error: %s\n", info.error().message().c_str());
+  } else if (info.status == token_status_error) {
+    Serial.printf("Firebase token error: %s\n", info.error.message.c_str());
   }
 }
 
@@ -277,8 +278,7 @@ void setupFirebaseListeners() {
   }
 
   String statusPath = "users/" + uid + "/feederStatus/isOnline";
-  // Renamed function for new library version
-  if (Firebase.RTDB.onDisconnectSet(&fbdo, statusPath.c_str(), false)) {
+  if (Firebase.RTDB.setOnDisconnect(&fbdo, statusPath.c_str(), false)) {
     Serial.println("onDisconnect handler set for isOnline status.");
   } else {
     Serial.println("Failed to set onDisconnect handler: " + fbdo.errorReason());
