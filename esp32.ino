@@ -1,7 +1,7 @@
 /*
  *  ASPetFeeder ESP32 Firmware
- *  VERSION 11
- *  Removed setOnDisconnect in setupFirebaseListeners
+ *  VERSION 11.2 (JOEY)
+ *  Added servo feeding logic in performFeed()
  */
 
 #include <WiFi.h>
@@ -10,6 +10,7 @@
 #include <Firebase_ESP_Client.h>
 #include "time.h"
 #include <ESP32Time.h>
+#include <ESP32Servo.h>  // Added Servo library
 
 #define API_KEY       "AIzaSyCc7CfbiUP7ivEo4Vrgr-2Gq3i1xmaCrVE"       
 #define DATABASE_URL  "https://aspetfeeder-default-rtdb.asia-southeast1.firebasedatabase.app/" 
@@ -34,6 +35,8 @@ FirebaseAuth auth;
 FirebaseConfig config;
 ESP32Time rtc; 
 String uid; 
+
+Servo feederServo;  // Servo object
 
 struct Schedule {
   String id;
@@ -142,12 +145,29 @@ void performFeed(int amount, const String& mode) {
   Serial.printf("FEEDING: %d grams, Mode: %s\n", amount, mode.c_str());
   
   // --- MOTOR CONTROL LOGIC HERE ---
-  // Example:
-  // digitalWrite(MOTOR_PIN, HIGH);
-  // delay(amount * 100); // Simple delay based on amount, needs calibration
-  // digitalWrite(MOTOR_PIN, LOW);
-  // in short, pakiadd nalang dito yung gumaganang code nung nacocontrol mo yung motor.
+  /*
+   * Servo Motor Feeding Logic
+   * The servo will rotate to 90 degrees to release food,
+   * then return to 0 degrees after a short delay.
+   * Adjust the delay and angles for your feeder design.
+   */
 
+  int openAngle = 90;    // angle to release food
+  int closeAngle = 0;    // angle to stop feeding
+  int baseDelay = 1500;  // base open time
+  int extraTime = amount * 10; // add delay based on food weight (adjust if needed)
+
+  feederServo.write(openAngle);
+  Serial.println("Servo: Dispensing food...");
+  delay(baseDelay + extraTime); // hold open
+
+  feederServo.write(closeAngle);
+  Serial.println("Servo: Feeding complete.");
+  delay(500); // small pause before continuing
+
+  // --- END SERVO CONTROL ---
+
+  // Update Firebase feed status and history
   String statusPath = "users/" + uid + "/feederStatus";
   FirebaseJson statusUpdate;
 
@@ -288,8 +308,13 @@ void setupFirebaseListeners() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\nASPetFeeder Firmware Starting...");
-  pinMode(MOTOR_PIN, OUTPUT);
-  digitalWrite(MOTOR_PIN, LOW);
+  // commented pinmode and digitalWrite since these are redundant - RYAN
+  // pinMode(MOTOR_PIN, OUTPUT);
+  // digitalWrite(MOTOR_PIN, LOW);
+
+  feederServo.attach(MOTOR_PIN);  // attach servo to pin
+  feederServo.write(0);           // initial closed position
+
   preferences.begin("feeder-config", true); 
   bool configured = preferences.getBool("configured", false);
   preferences.end();
