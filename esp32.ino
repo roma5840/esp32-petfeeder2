@@ -1,7 +1,10 @@
 /*
  *  ASPetFeeder ESP32 Firmware
- *  VERSION 11.2 (JOEY)
- *  Added servo feeding logic in performFeed()
+ *  VERSION 11.4 (MERGED STABLE - CORRECTED)
+ *  - Base: Version 11.3 (Stable setup, auth, and structure)
+ *  - Merged: Schedule parsing and triggering logic from Version 11.2
+ *  - Fixed: Success response in handleConfig() to include "OK" for app compatibility
+ *  - Fixed: lastCheckedDay initialization, improved error handling
  */
 
 #include <WiFi.h>
@@ -10,22 +13,18 @@
 #include <Firebase_ESP_Client.h>
 #include "time.h"
 #include <ESP32Time.h>
-#include <ESP32Servo.h>  // Added Servo library
+#include <ESP32Servo.h>
 
+// ------------------- CONSTANTS -------------------
 #define API_KEY       "AIzaSyCc7CfbiUP7ivEo4Vrgr-2Gq3i1xmaCrVE"       
 #define DATABASE_URL  "https://aspetfeeder-default-rtdb.asia-southeast1.firebasedatabase.app/" 
+#define MOTOR_PIN 23
+#define MAX_SCHEDULES 10
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 28800
+#define DAYLIGHT_OFFSET_SEC 0
 
-const char* SETUP_SSID = "PetFeeder-Setup"; 
-IPAddress apIP(192, 168, 4, 1);
-IPAddress apGateway(192, 168, 4, 1);
-IPAddress apSubnet(255, 255, 255, 0);
-// edit motor pin/s as needed
-const int MOTOR_PIN = 23; 
-const int MAX_SCHEDULES = 10;
-const char* NTP_SERVER = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = 28800; 
-const int   DAYLIGHT_OFFSET_SEC = 0; 
-
+// ------------------- OBJECTS -------------------
 WebServer server(80);
 Preferences preferences;
 FirebaseData fbdo;
@@ -35,9 +34,9 @@ FirebaseAuth auth;
 FirebaseConfig config;
 ESP32Time rtc; 
 String uid; 
+Servo feederServo;
 
-Servo feederServo;  // Servo object
-
+// ------------------- STRUCT -------------------
 struct Schedule {
   String id;
   int weight;
@@ -48,13 +47,14 @@ struct Schedule {
 };
 Schedule schedules[MAX_SCHEDULES];
 int scheduleCount = 0;
-int lastCheckedDay = 0; 
+int lastCheckedDay = -1; // Initialize to -1 to ensure first day is properly set
 bool isInSetupMode = false;
 unsigned long lastStatusUpdate = 0;
 
+// ------------------- FUNCTIONS -------------------
 void tokenStatusCallback(TokenInfo info) {
   if (info.status == token_status_ready) {
-    Serial.println("Firebase token is ready.");
+    Serial.println("Firebase token ready.");
   } else if (info.status == token_status_error) {
     Serial.printf("Firebase token error: %s\n", info.error.message.c_str());
   }
@@ -66,52 +66,62 @@ void handleRoot() {
 }
 
 void handleConfig() {
-  Serial.println("Received /config request.");
+  Serial.println("\nReceived /config request");
+
   if (!server.hasArg("ssid") || !server.hasArg("uid") || !server.hasArg("email") || !server.hasArg("user_pass")) {
     server.send(400, "text/plain", "Bad Request: Missing parameters.");
     return;
   }
+
   String home_ssid = server.arg("ssid");
   String home_pass = server.hasArg("password") ? server.arg("password") : "";
   String user_uid = server.arg("uid");
   String user_email = server.arg("email");
   String user_password = server.arg("user_pass");
 
-  Serial.print("Testing new WiFi connection...");
+  Serial.println("Connecting to home WiFi...");
   WiFi.begin(home_ssid.c_str(), home_pass.c_str());
-  int retries = 20; 
-  while (WiFi.status() != WL_CONNECTED && retries > 0) {
+  int retries = 25;
+  while (WiFi.status() != WL_CONNECTED && retries-- > 0) {
     delay(500);
     Serial.print(".");
-    retries--;
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nWiFi connection failed. Aborting.");
+    Serial.println("\nWiFi connection failed.");
     server.send(401, "text/plain", "WiFi Connection Failed. Check SSID and Password.");
     WiFi.disconnect(); 
     return;
   }
-  Serial.println("\nWiFi connection successful!");
+  Serial.println("\nWiFi connected successfully.");
 
   Serial.println("Testing Firebase authentication...");
   config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
   auth.user.email = user_email;
   auth.user.password = user_password;
+  config.token_status_callback = tokenStatusCallback;
   Firebase.begin(&config, &auth);
-  
-  unsigned long start_time = millis();
-  while (Firebase.getToken() == "" && millis() - start_time < 15000) {
-    delay(100);
+  Firebase.reconnectWiFi(true);
+
+  unsigned long start = millis();
+  bool authSuccess = false;
+  while (millis() - start < 10000) {
+    if (Firebase.ready()) {
+      authSuccess = true;
+      break;
+    }
+    delay(500);
   }
-  if (Firebase.getToken() == "") {
-    Serial.println("Firebase sign-in timed out or failed.");
-    server.send(401, "text/plain", "Firebase Auth Failed. Check your app password.");
+
+  if (!authSuccess) {
+    Serial.println("Firebase authentication failed or timed out.");
+    server.send(401, "text/plain", "Firebase Auth Failed. Check your credentials.");
     WiFi.disconnect();
     return;
   }
   Serial.println("Firebase authentication successful!");
 
-  Serial.println("Saving configuration to flash memory...");
+  Serial.println("Saving configuration...");
   preferences.begin("feeder-config", false);
   preferences.putString("ssid", home_ssid);
   preferences.putString("pass", home_pass);
@@ -121,8 +131,9 @@ void handleConfig() {
   preferences.putBool("configured", true);
   preferences.end();
 
+  // Response includes "OK" to match app's check: responseText.includes('OK')
   server.send(200, "text/plain", "Configuration successful! OK. The feeder will now restart.");
-  Serial.println("Configuration successful! Restarting in 3 seconds...");
+  Serial.println("Configuration saved. Restarting...");
   delay(3000);
   ESP.restart();
 }
@@ -130,154 +141,167 @@ void handleConfig() {
 void startSetupMode() {
   isInSetupMode = true;
   Serial.println("\nStarting Setup Mode...");
-  Serial.printf("Connect to WiFi network: %s\n", SETUP_SSID);
-  WiFi.softAP(SETUP_SSID);
+  WiFi.softAP("PetFeeder-Setup");
   delay(100);
-  WiFi.softAPConfig(apIP, apGateway, apSubnet);
-  Serial.printf("AP IP address: %s\n", WiFi.softAPIP().toString().c_str());
+  WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  Serial.printf("Connect to WiFi: PetFeeder-Setup\nAP IP: %s\n", WiFi.softAPIP().toString().c_str());
   server.on("/", HTTP_GET, handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.begin();
-  Serial.println("Web server started. Waiting for configuration from the app.");
+  Serial.println("Web server started. Waiting for configuration...");
 }
 
 void performFeed(int amount, const String& mode) {
-  Serial.printf("FEEDING: %d grams, Mode: %s\n", amount, mode.c_str());
-  
-  // --- MOTOR CONTROL LOGIC HERE ---
-  /*
-   * Servo Motor Feeding Logic
-   * The servo will rotate to 90 degrees to release food,
-   * then return to 0 degrees after a short delay.
-   * Adjust the delay and angles for your feeder design.
-   */
+  Serial.printf("Feeding: %d grams (%s)\n", amount, mode.c_str());
 
-  int openAngle = 90;    // angle to release food
-  int closeAngle = 0;    // angle to stop feeding
-  int baseDelay = 1500;  // base open time
-  int extraTime = amount * 10; // add delay based on food weight (adjust if needed)
+  int openAngle = 90;
+  int closeAngle = 0;
+  int baseDelay = 1500;
+  int extraTime = amount * 10;
 
   feederServo.write(openAngle);
-  Serial.println("Servo: Dispensing food...");
-  delay(baseDelay + extraTime); // hold open
-
+  Serial.println("  Servo: Dispensing food...");
+  delay(baseDelay + extraTime);
   feederServo.write(closeAngle);
-  Serial.println("Servo: Feeding complete.");
-  delay(500); // small pause before continuing
+  Serial.println("  Servo: Feeding complete.");
+  delay(500);
 
-  // --- END SERVO CONTROL ---
-
-  // Update Firebase feed status and history
+  // Update Firebase feed status
   String statusPath = "users/" + uid + "/feederStatus";
   FirebaseJson statusUpdate;
-
-  // Create a separate JSON object for the server value timestamp
   FirebaseJson sv_timestamp;
   sv_timestamp.set(".sv", "timestamp");
   statusUpdate.set("lastFeedTimestamp", sv_timestamp);
   statusUpdate.set("lastFeedAmount", String(amount));
 
   if (Firebase.RTDB.updateNode(&fbdo, statusPath.c_str(), &statusUpdate)) {
-    Serial.println("Successfully updated last feed status.");
+    Serial.println("  Feed status updated.");
   } else {
-    Serial.println("Failed to update last feed status: " + fbdo.errorReason());
+    Serial.println("  Failed to update feed status: " + fbdo.errorReason());
   }
 
+  // Add to feeding history
   String historyPath = "users/" + uid + "/feedingHistory/" + String(rtc.getEpoch());
   FirebaseJson historyEntry;
   historyEntry.set("amount", String(amount));
   historyEntry.set("type", mode);
   historyEntry.set("timestamp", sv_timestamp);
-
+  
   if (Firebase.RTDB.setJSON(&fbdo, historyPath.c_str(), &historyEntry)) {
-      Serial.println("Successfully added entry to feeding history.");
+    Serial.println("  Added to feeding history.");
   } else {
-      Serial.println("Failed to add feeding history entry: " + fbdo.errorReason());
+    Serial.println("  Failed to add to history: " + fbdo.errorReason());
   }
 }
 
 void feedNowStreamCallback(FirebaseStream data) {
-  Serial.println("Stream: 'feedNow' data received.");
+  Serial.println("'Feed Now' stream data received.");
   if (data.dataTypeEnum() == firebase_rtdb_data_type_json) {
     FirebaseJson *json = data.jsonObjectPtr();
     FirebaseJsonData result;
     if (json && json->get(result, "amount") && result.success) {
       int feedAmount = result.to<int>();
-      Serial.printf("Received manual feed command for %d grams.\n", feedAmount);
+      Serial.printf("  Manual feed requested: %d grams\n", feedAmount);
       performFeed(feedAmount, "Manual");
       String commandPath = "users/" + uid + "/commands/feedNow";
       if (Firebase.RTDB.deleteNode(&fbdo, commandPath.c_str())) {
-        Serial.println("Feed command node deleted.");
-      } else {
-        Serial.println("Failed to delete feed command node: " + fbdo.errorReason());
+        Serial.println("  Feed command cleared.");
       }
     }
   }
 }
 
 void schedulesStreamCallback(FirebaseStream data) {
-  Serial.println("Stream: Schedule data received.");
+  Serial.println("Schedule data received. Parsing...");
   scheduleCount = 0; 
+  
   if (data.dataTypeEnum() == firebase_rtdb_data_type_json) {
     FirebaseJson *json = data.jsonObjectPtr();
-    if (!json) return;
+    if (!json) {
+      Serial.println("  JSON object is null.");
+      return;
+    }
+    
     size_t len = json->iteratorBegin();
     String key, value;
     int type;
+    
     for (size_t i = 0; i < len && scheduleCount < MAX_SCHEDULES; i++) {
       json->iteratorGet(i, type, key, value);
       if (type == FirebaseJson::JSON_OBJECT) {
         FirebaseJson scheduleJson;
         scheduleJson.setJsonData(value);
         FirebaseJsonData s_id, s_time, s_weight, s_isOn;
+        
         if (scheduleJson.get(s_id, "id") && scheduleJson.get(s_time, "time") &&
             scheduleJson.get(s_weight, "weight") && scheduleJson.get(s_isOn, "isOn")) {
+          
           schedules[scheduleCount].id = s_id.to<String>();
           schedules[scheduleCount].weight = s_weight.to<int>();
           schedules[scheduleCount].isOn = s_isOn.to<bool>();
+          
+          // Parse time string (format: "HH:MM AM/PM")
           String timeStr = s_time.to<String>();
           int h = timeStr.substring(0, timeStr.indexOf(":")).toInt();
           int m = timeStr.substring(timeStr.indexOf(":") + 1, timeStr.lastIndexOf(" ")).toInt();
+          
+          // Convert to 24-hour format
           if (timeStr.indexOf("PM") > -1 && h != 12) h += 12;
           if (timeStr.indexOf("AM") > -1 && h == 12) h = 0;
+          
           schedules[scheduleCount].hour = h;
           schedules[scheduleCount].minute = m;
           schedules[scheduleCount].triggeredToday = false;
-          Serial.printf("Loaded Schedule %d: ID %s, Time %02d:%02d, Weight %dg, On: %s\n",
-                        scheduleCount + 1, schedules[scheduleCount].id.c_str(),
-                        h, m, schedules[scheduleCount].weight,
+          
+          Serial.printf("  > Schedule %d: ID=%s, Time=%02d:%02d, Weight=%dg, Enabled=%s\n",
+                        scheduleCount + 1, 
+                        schedules[scheduleCount].id.c_str(),
+                        h, m, 
+                        schedules[scheduleCount].weight,
                         schedules[scheduleCount].isOn ? "Yes" : "No");
           scheduleCount++;
         }
       }
     }
     json->iteratorEnd();
+    Serial.printf("  Total schedules loaded: %d\n", scheduleCount);
+    
   } else if (data.dataTypeEnum() == firebase_rtdb_data_type_null) {
-    Serial.println("All schedules were deleted from Firebase.");
+    Serial.println("  All schedules deleted from Firebase.");
   }
 }
 
 void streamTimeoutCallback(bool timeout) {
   if (timeout) {
-    Serial.println("Stream timeout, will be resumed automatically.");
+    Serial.println("Stream timeout. Will resume automatically...");
   }
 }
 
 void checkSchedules() {
   if (scheduleCount == 0) return;
-  if (rtc.getDay() != lastCheckedDay) {
-    Serial.println("New day detected. Resetting schedule triggers.");
+  
+  // Check if day has changed - reset all triggers
+  int currentDay = rtc.getDay();
+  if (currentDay != lastCheckedDay) {
+    Serial.printf("New day detected (was %d, now %d). Resetting triggers.\n", lastCheckedDay, currentDay);
     for (int i = 0; i < scheduleCount; i++) {
       schedules[i].triggeredToday = false;
     }
-    lastCheckedDay = rtc.getDay();
+    lastCheckedDay = currentDay;
   }
+  
+  // Check each schedule
+  int currentHour = rtc.getHour(true);  // 24-hour format
+  int currentMinute = rtc.getMinute();
+  
   for (int i = 0; i < scheduleCount; i++) {
     if (schedules[i].isOn && !schedules[i].triggeredToday) {
-      if (rtc.getHour(true) == schedules[i].hour && rtc.getMinute() == schedules[i].minute) {
-        Serial.printf("SCHEDULE TRIGGERED: ID %s, %dg\n", schedules[i].id.c_str(), schedules[i].weight);
+      if (currentHour == schedules[i].hour && currentMinute == schedules[i].minute) {
+        Serial.printf("⏰ SCHEDULE TRIGGERED: ID=%s, Amount=%dg\n", 
+                      schedules[i].id.c_str(), 
+                      schedules[i].weight);
         performFeed(schedules[i].weight, "Scheduled");
-        schedules[i].triggeredToday = true; 
+        schedules[i].triggeredToday = true;
       }
     }
   }
@@ -286,43 +310,43 @@ void checkSchedules() {
 void setupFirebaseListeners() {
   String feedNowPath = "users/" + uid + "/commands/feedNow";
   String schedulesPath = "users/" + uid + "/schedules";
+
   if (!Firebase.RTDB.beginStream(&streamFeedNow, feedNowPath.c_str())) {
     Serial.println("Could not begin 'feedNow' stream: " + streamFeedNow.errorReason());
   } else {
     Firebase.RTDB.setStreamCallback(&streamFeedNow, feedNowStreamCallback, streamTimeoutCallback);
+    Serial.println("Listening for 'Feed Now' commands.");
   }
+  
   if (!Firebase.RTDB.beginStream(&streamSchedules, schedulesPath.c_str())) {
     Serial.println("Could not begin 'schedules' stream: " + streamSchedules.errorReason());
   } else {
     Firebase.RTDB.setStreamCallback(&streamSchedules, schedulesStreamCallback, streamTimeoutCallback);
-  }
-
-  String statusPath = "users/" + uid + "/feederStatus/isOnline";
-  if (Firebase.RTDB.setBool(&fbdo, statusPath.c_str(), true)) {
-    Serial.println("Feeder status set to ONLINE.");
-  } else {
-    Serial.println("Failed to set feeder status to online: " + fbdo.errorReason());
+    Serial.println("Listening for schedule updates.");
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\nASPetFeeder Firmware Starting...");
-  // commented pinmode and digitalWrite since these are redundant - RYAN
-  // pinMode(MOTOR_PIN, OUTPUT);
-  // digitalWrite(MOTOR_PIN, LOW);
+  Serial.println("\nASPetFeeder Firmware v11.4 Booting...");
 
-  feederServo.attach(MOTOR_PIN);  // attach servo to pin
-  feederServo.write(0);           // initial closed position
+  // Initialize servo
+  feederServo.attach(MOTOR_PIN);
+  feederServo.write(0);
+  Serial.println("  Servo initialized at position 0°");
 
-  preferences.begin("feeder-config", true); 
+  // Check if device is configured
+  preferences.begin("feeder-config", true);
   bool configured = preferences.getBool("configured", false);
   preferences.end();
+
   if (!configured) {
     startSetupMode();
   } else {
     isInSetupMode = false;
     Serial.println("Configuration found. Starting Operational Mode...");
+    
+    // Load saved credentials
     preferences.begin("feeder-config", true);
     String ssid = preferences.getString("ssid", "");
     String pass = preferences.getString("pass", "");
@@ -330,27 +354,35 @@ void setup() {
     String email = preferences.getString("email", "");
     String user_pass = preferences.getString("user_pass", "");
     preferences.end();
+
+    // Connect to WiFi
     WiFi.begin(ssid.c_str(), pass.c_str());
     Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
       Serial.print(".");
       delay(500);
     }
-    Serial.println(" connected!");
+    Serial.println(" Connected!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
+
+    // Initialize Firebase
     config.api_key = API_KEY;
     config.database_url = DATABASE_URL;
     auth.user.email = email;
     auth.user.password = user_pass;
-    config.token_status_callback = tokenStatusCallback; 
+    config.token_status_callback = tokenStatusCallback;
     Firebase.begin(&config, &auth);
     Firebase.reconnectWiFi(true);
+
+    // Synchronize time
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
       rtc.setTimeStruct(timeinfo);
+      lastCheckedDay = rtc.getDay(); // CRITICAL: Initialize lastCheckedDay
       Serial.println("Time synchronized: " + rtc.getTimeDate());
+      Serial.printf("  Current day of month: %d\n", lastCheckedDay);
     } else {
       Serial.println("Failed to obtain time from NTP server.");
     }
@@ -365,21 +397,29 @@ void loop() {
       static bool listeners_setup = false;
       if (!listeners_setup) {
         setupFirebaseListeners();
+        // Set initial online status
+        String statusPath = "users/" + uid + "/feederStatus/isOnline";
+        if (Firebase.RTDB.setBool(&fbdo, statusPath.c_str(), true)) {
+          Serial.println("Feeder status set to ONLINE.");
+        }
         listeners_setup = true;
       }
-      checkSchedules();
+
+      // Check schedules every loop iteration
+      checkSchedules(); 
+      
+      // Heartbeat: Update online status every 5 minutes
       if (millis() - lastStatusUpdate > 300000) {
         lastStatusUpdate = millis();
-        String statusPath = "users/" + uid + "/feederStatus/isOnline";
-        Firebase.RTDB.setBool(&fbdo, statusPath.c_str(), true);
-        Serial.println("Heartbeat: Refreshed online status.");
+        Firebase.RTDB.setBool(&fbdo, ("users/" + uid + "/feederStatus/isOnline").c_str(), true);
+        Serial.println("Heartbeat: online status refreshed.");
       }
     } else if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi disconnected. Attempting to reconnect...");
-        delay(5000);
-    } else { 
-        Serial.println("WiFi OK, but Firebase not ready. Check credentials or network rules.");
-        delay(5000);
+      Serial.println("WiFi disconnected. Reconnecting...");
+      delay(5000);
+    } else {
+      Serial.println("Firebase not ready. Waiting...");
+      delay(5000);
     }
   }
 }
