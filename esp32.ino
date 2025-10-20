@@ -1,5 +1,7 @@
 /*
  *  ASPetFeeder ESP32 Firmware
+ *  VERSION 11.4.1
+ *  - Changed: 'Manual' to 'manual'
  *  VERSION 11.4 (MERGED STABLE - CORRECTED)
  *  - Base: Version 11.3 (Stable setup, auth, and structure)
  *  - Merged: Schedule parsing and triggering logic from Version 11.2
@@ -202,7 +204,7 @@ void feedNowStreamCallback(FirebaseStream data) {
     if (json && json->get(result, "amount") && result.success) {
       int feedAmount = result.to<int>();
       Serial.printf("  Manual feed requested: %d grams\n", feedAmount);
-      performFeed(feedAmount, "Manual");
+      performFeed(feedAmount, "manual");
       String commandPath = "users/" + uid + "/commands/feedNow";
       if (Firebase.RTDB.deleteNode(&fbdo, commandPath.c_str())) {
         Serial.println("  Feed command cleared.");
@@ -297,7 +299,7 @@ void checkSchedules() {
   for (int i = 0; i < scheduleCount; i++) {
     if (schedules[i].isOn && !schedules[i].triggeredToday) {
       if (currentHour == schedules[i].hour && currentMinute == schedules[i].minute) {
-        Serial.printf("⏰ SCHEDULE TRIGGERED: ID=%s, Amount=%dg\n", 
+        Serial.printf("SCHEDULE TRIGGERED: ID=%s, Amount=%dg\n", 
                       schedules[i].id.c_str(), 
                       schedules[i].weight);
         performFeed(schedules[i].weight, "Scheduled");
