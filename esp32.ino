@@ -1,5 +1,8 @@
 /*
  *  ASPetFeeder ESP32 Firmware
+ *  VERSION 11.5.1
+ *  - Fixed: Parsing problem in schedulesStreamCallback for "h:mm AM/PM" and "hh:mm" format
+ *  - Added: parseSchedule
  *  VERSION 11.5 - JOEY
  *  - Added: LCD integration
  *  VERSION 11.4.1
@@ -236,63 +239,112 @@ void feedNowStreamCallback(FirebaseStream data) {
   }
 }
 
-void schedulesStreamCallback(FirebaseStream data) {
-  Serial.println("Schedule data received. Parsing...");
-  scheduleCount = 0; 
-  
-  if (data.dataTypeEnum() == firebase_rtdb_data_type_json) {
-    FirebaseJson *json = data.jsonObjectPtr();
-    if (!json) {
-      Serial.println("  JSON object is null.");
-      return;
+bool parseSchedule(FirebaseJson &json, Schedule &schedule) {
+  FirebaseJsonData s_id, s_time, s_weight, s_isOn;
+
+  if (json.get(s_id, "id") && json.get(s_time, "time") &&
+      json.get(s_weight, "weight") && json.get(s_isOn, "isOn")) {
+
+    schedule.id = s_id.to<String>();
+    schedule.weight = s_weight.to<int>();
+    schedule.isOn = s_isOn.to<bool>();
+    schedule.triggeredToday = false; // Always reset trigger on parse
+
+    String timeStr = s_time.to<String>();
+    int h = 0, m = 0;
+    String upperTimeStr = timeStr;
+    upperTimeStr.toUpperCase();
+
+    if (upperTimeStr.indexOf("AM") > -1 || upperTimeStr.indexOf("PM") > -1) {
+      h = timeStr.substring(0, timeStr.indexOf(":")).toInt();
+      m = timeStr.substring(timeStr.indexOf(":") + 1, timeStr.lastIndexOf(" ")).toInt();
+      if (upperTimeStr.indexOf("PM") > -1 && h != 12) h += 12;
+      if (upperTimeStr.indexOf("AM") > -1 && h == 12) h = 0;
+    } else {
+      h = timeStr.substring(0, timeStr.indexOf(":")).toInt();
+      m = timeStr.substring(timeStr.indexOf(":") + 1).toInt();
     }
-    
-    size_t len = json->iteratorBegin();
-    String key, value;
-    int type;
-    
-    for (size_t i = 0; i < len && scheduleCount < MAX_SCHEDULES; i++) {
-      json->iteratorGet(i, type, key, value);
-      if (type == FirebaseJson::JSON_OBJECT) {
-        FirebaseJson scheduleJson;
-        scheduleJson.setJsonData(value);
-        FirebaseJsonData s_id, s_time, s_weight, s_isOn;
-        
-        if (scheduleJson.get(s_id, "id") && scheduleJson.get(s_time, "time") &&
-            scheduleJson.get(s_weight, "weight") && scheduleJson.get(s_isOn, "isOn")) {
-          
-          schedules[scheduleCount].id = s_id.to<String>();
-          schedules[scheduleCount].weight = s_weight.to<int>();
-          schedules[scheduleCount].isOn = s_isOn.to<bool>();
-          
-          // Parse time string (format: "HH:MM AM/PM")
-          String timeStr = s_time.to<String>();
-          int h = timeStr.substring(0, timeStr.indexOf(":")).toInt();
-          int m = timeStr.substring(timeStr.indexOf(":") + 1, timeStr.lastIndexOf(" ")).toInt();
-          
-          // Convert to 24-hour format
-          if (timeStr.indexOf("PM") > -1 && h != 12) h += 12;
-          if (timeStr.indexOf("AM") > -1 && h == 12) h = 0;
-          
-          schedules[scheduleCount].hour = h;
-          schedules[scheduleCount].minute = m;
-          schedules[scheduleCount].triggeredToday = false;
-          
-          Serial.printf("  > Schedule %d: ID=%s, Time=%02d:%02d, Weight=%dg, Enabled=%s\n",
-                        scheduleCount + 1, 
-                        schedules[scheduleCount].id.c_str(),
-                        h, m, 
-                        schedules[scheduleCount].weight,
-                        schedules[scheduleCount].isOn ? "Yes" : "No");
+    schedule.hour = h;
+    schedule.minute = m;
+    return true; // Success
+  }
+  return false; // Failure
+}
+
+
+void schedulesStreamCallback(FirebaseStream data) {
+  Serial.println("\nSchedule data received.");
+  Serial.printf("  - Stream path: %s\n", data.streamPath().c_str());
+  Serial.printf("  - Data path: %s\n", data.dataPath().c_str());
+  Serial.printf("  - Event type: %s\n", data.eventType().c_str());
+
+  // CASE 1: FULL DATA REFRESH
+  if (data.dataPath() == "/") {
+    scheduleCount = 0;
+    if (data.dataTypeEnum() == firebase_rtdb_data_type_json) {
+      FirebaseJson *json = data.jsonObjectPtr();
+      size_t len = json->iteratorBegin();
+      FirebaseJson::IteratorValue value;
+      Serial.printf("  > Full refresh. Found %d total schedules in object.\n", len);
+
+      for (size_t i = 0; i < len && scheduleCount < MAX_SCHEDULES; i++) {
+        value = json->valueAt(i);
+        if (value.type == FirebaseJson::JSON_OBJECT) {
+          FirebaseJson scheduleJson;
+          scheduleJson.setJsonData(value.value);
+          if (parseSchedule(scheduleJson, schedules[scheduleCount])) {
+            Serial.printf("    - Loaded schedule: ID=%s, Time=%02d:%02d\n", schedules[scheduleCount].id.c_str(), schedules[scheduleCount].hour, schedules[scheduleCount].minute);
+            scheduleCount++;
+          }
+        }
+      }
+      json->iteratorEnd();
+    } else if (data.dataTypeEnum() == firebase_rtdb_data_type_null) {
+      Serial.println("  > All schedules are deleted.");
+      scheduleCount = 0;
+    }
+    Serial.printf("  > Total schedules loaded after full refresh: %d\n", scheduleCount);
+  }
+  // CASE 2: SINGLE ITEM UPDATE
+  else {
+    String scheduleId = data.dataPath();
+    scheduleId.remove(0, 1);
+
+    int existingIndex = -1;
+    for (int i = 0; i < scheduleCount; i++) {
+      if (schedules[i].id == scheduleId) {
+        existingIndex = i;
+        break;
+      }
+    }
+
+    if (data.dataTypeEnum() == firebase_rtdb_data_type_null) {
+      Serial.printf("  > Deleting schedule ID: %s\n", scheduleId.c_str());
+      if (existingIndex != -1) {
+        for (int i = existingIndex; i < scheduleCount - 1; i++) {
+          schedules[i] = schedules[i + 1];
+        }
+        scheduleCount--;
+        Serial.println("    - Successfully removed from local list.");
+      }
+    } 
+    else if (data.dataTypeEnum() == firebase_rtdb_data_type_json) {
+      FirebaseJson *json = data.jsonObjectPtr(); // Get the JSON object of the single item
+      Schedule tempSchedule;
+
+      if (json && parseSchedule(*json, tempSchedule)) {
+        if (existingIndex != -1) {
+          Serial.printf("  > Updating schedule ID: %s\n", scheduleId.c_str());
+          schedules[existingIndex] = tempSchedule;
+        } 
+        else if (scheduleCount < MAX_SCHEDULES) {
+          Serial.printf("  > Adding new schedule ID: %s\n", scheduleId.c_str());
+          schedules[scheduleCount] = tempSchedule;
           scheduleCount++;
         }
       }
     }
-    json->iteratorEnd();
-    Serial.printf("  Total schedules loaded: %d\n", scheduleCount);
-    
-  } else if (data.dataTypeEnum() == firebase_rtdb_data_type_null) {
-    Serial.println("  All schedules deleted from Firebase.");
+    Serial.printf("  > Total schedules now: %d\n", scheduleCount);
   }
 }
 
