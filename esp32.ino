@@ -1,5 +1,7 @@
 /*
  *  ASPetFeeder ESP32 Firmware
+ *  VERSION 11.5 - JOEY
+ *  - Added: LCD integration
  *  VERSION 11.4.1
  *  - Changed: 'Manual' to 'manual'
  *  VERSION 11.4 (MERGED STABLE - CORRECTED)
@@ -16,6 +18,7 @@
 #include "time.h"
 #include <ESP32Time.h>
 #include <ESP32Servo.h>
+#include <LiquidCrystal_I2C.h>
 
 // ------------------- CONSTANTS -------------------
 #define API_KEY       "AIzaSyCc7CfbiUP7ivEo4Vrgr-2Gq3i1xmaCrVE"       
@@ -37,6 +40,7 @@ FirebaseConfig config;
 ESP32Time rtc; 
 String uid; 
 Servo feederServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
 // ------------------- STRUCT -------------------
 struct Schedule {
@@ -161,11 +165,30 @@ void performFeed(int amount, const String& mode) {
   int baseDelay = 1500;
   int extraTime = amount * 10;
 
+  // --- LCD: Show releasing message ---
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Releasing Food");
+  lcd.setCursor(0, 1);
+  lcd.print(String(amount) + "g " + mode);
+
+  // --- Servo motion ---
   feederServo.write(openAngle);
   Serial.println("  Servo: Dispensing food...");
   delay(baseDelay + extraTime);
   feederServo.write(closeAngle);
   Serial.println("  Servo: Feeding complete.");
+
+  // --- LCD: Show completion message ---
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Feeding Complete");
+  lcd.setCursor(0, 1);
+  lcd.print(String(amount) + "g " + mode);
+  delay(2000);
+  lcd.clear();
+  lcd.print("Waiting...");
+
   delay(500);
 
   // Update Firebase feed status
@@ -330,6 +353,16 @@ void setupFirebaseListeners() {
 
 void setup() {
   Serial.begin(115200);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ASPetFeeder");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+  lcd.clear();
+  lcd.print("Waiting...");
   Serial.println("\nASPetFeeder Firmware v11.4 Booting...");
 
   // Initialize servo
