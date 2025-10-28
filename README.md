@@ -47,5 +47,5 @@ You must install the following libraries in your Arduino IDE before compiling th
 ## Versioning
 
 -   **Current Firmware Version:** `v11.5.1`
--   **Compatible App Version:** `v1.16.2`
+-   **Compatible App Version:** `v1.16.2 or later`
 -   **Base Init Commit:** `9esp32`
