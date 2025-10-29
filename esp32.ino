@@ -1,5 +1,8 @@
 /*
  *  ASPetFeeder ESP32 Firmware
+ *  VERSION 11.5.2
+ *  - Changed: Swapped openAngle and closeAngle
+ *  - Added: Wire.begin for LCD
  *  VERSION 11.5.1
  *  - Fixed: Parsing problem in schedulesStreamCallback for "h:mm AM/PM" and "hh:mm" format
  *  - Added: parseSchedule
@@ -163,8 +166,8 @@ void startSetupMode() {
 void performFeed(int amount, const String& mode) {
   Serial.printf("Feeding: %d grams (%s)\n", amount, mode.c_str());
 
-  int openAngle = 90;
-  int closeAngle = 0;
+  int openAngle = 0;
+  int closeAngle = 90;
   int baseDelay = 1500;
   int extraTime = amount * 10;
 
@@ -405,6 +408,7 @@ void setupFirebaseListeners() {
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
   lcd.clear();
